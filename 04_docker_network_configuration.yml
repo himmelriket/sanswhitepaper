@@ -1,0 +1,332 @@
+---
+- name: Configure Docker macvlan Networks for Segmented Architecture
+  hosts: servers
+  become: yes
+  vars:
+    mgmt_interface: enp89s0
+    docker_macvlan_networks:
+      - name: vlan101-network
+        vlan_interface: enp89s0.101
+        subnet: 10.101.0.0/24
+        gateway: 10.101.0.1
+        ip_range: 10.101.0.10/28
+        vlan_id: 101
+        description: "APPLICATION ALPHA VLAN"
+      - name: vlan102-network
+        vlan_interface: enp89s0.102
+        subnet: 10.102.0.0/24
+        gateway: 10.102.0.1
+        ip_range: 10.102.0.10/28
+        vlan_id: 102
+        description: "APPLICATION BRAVO VLAN"
+      - name: vlan103-network
+        vlan_interface: enp89s0.103
+        subnet: 10.103.0.0/24
+        gateway: 10.103.0.1
+        ip_range: 10.103.0.10/28
+        vlan_id: 103
+        description: "APPLICATION CHARLIE VLAN"
+      - name: vlan104-network
+        vlan_interface: enp89s0.104
+        subnet: 10.104.0.0/24
+        gateway: 10.104.0.1
+        ip_range: 10.104.0.10/28
+        vlan_id: 104
+        description: "APPLICATION DELTA VLAN"
+
+  tasks:
+    - name: Verify Docker is installed
+      command: docker --version
+      register: docker_check
+      changed_when: false
+      failed_when: docker_check.rc != 0
+
+    - name: Display Docker version
+      debug:
+        msg: "Docker is installed: {{ docker_check.stdout }}"
+
+    - name: Verify VLAN interfaces exist before creating Docker networks
+      command: ip link show {{ item.vlan_interface }}
+      register: vlan_check
+      changed_when: false
+      failed_when: vlan_check.rc != 0
+      loop: "{{ docker_macvlan_networks }}"
+
+    - name: Display VLAN interface status
+      debug:
+        msg: "VLAN interface {{ item.vlan_interface }} exists and is ready"
+      loop: "{{ docker_macvlan_networks }}"
+
+    - name: Create Docker macvlan networks for segmented architecture
+      command: >
+        docker network create -d macvlan
+        --subnet={{ item.subnet }}
+        --gateway={{ item.gateway }}
+        --ip-range={{ item.ip_range }}
+        -o parent={{ item.vlan_interface }}
+        {{ item.name }}
+      register: network_create
+      failed_when: 
+        - network_create.rc != 0
+        - "'already exists' not in network_create.stderr"
+      changed_when: network_create.rc == 0
+      loop: "{{ docker_macvlan_networks }}"
+
+    - name: Verify Docker networks were created
+      command: docker network ls
+      register: docker_network_list
+      changed_when: false
+
+    - name: Display Docker networks
+      debug:
+        var: docker_network_list.stdout_lines
+
+    - name: Inspect each Docker macvlan network
+      command: docker network inspect {{ item.name }}
+      register: network_inspect
+      changed_when: false
+      loop: "{{ docker_macvlan_networks }}"
+
+    - name: Verify macvlan driver is used
+      shell: docker network inspect {{ item.name }} | grep -i "macvlan"
+      register: macvlan_verify
+      changed_when: false
+      failed_when: macvlan_verify.rc != 0
+      loop: "{{ docker_macvlan_networks }}"
+
+# Claude AI helped generate this code:
+# *** START ****
+
+    - name: Create macvlan shim creation script
+      copy:
+        dest: /root/create-macvlan-shim.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Create macvlan shim interfaces for host to container communication
+          
+          echo "Creating macvlan shim interfaces..."
+          echo ""
+          
+          {% for network in docker_macvlan_networks %}
+          echo "Creating shim for VLAN {{ network.vlan_id }}..."
+          
+          # Remove if exists
+          ip link del macvlan-shim-{{ network.vlan_id }} 2>/dev/null || true
+          
+          # Create shim
+          ip link add macvlan-shim-{{ network.vlan_id }} link {{ network.vlan_interface }} type macvlan mode bridge
+          
+          # Assign IP (use .254 for host access)
+          SHIM_IP="{{ network.subnet | regex_replace('/24', '') | regex_replace('\.0$', '.254') }}"
+          ip addr add ${SHIM_IP}/32 dev macvlan-shim-{{ network.vlan_id }}
+          
+          # Bring up
+          ip link set macvlan-shim-{{ network.vlan_id }} up
+          
+          # Add route
+          ip route add {{ network.ip_range }} dev macvlan-shim-{{ network.vlan_id }} 2>/dev/null || true
+          
+          echo "  ✓ macvlan-shim-{{ network.vlan_id }}: ${SHIM_IP}"
+          {% endfor %}
+          
+          echo ""
+          echo "Macvlan shim interfaces created!"
+          echo ""
+          echo "Test connectivity:"
+          {% for network in docker_macvlan_networks %}
+          echo "  ping {{ network.ip_range | regex_replace('/28', '') | regex_replace('\.0$', '.10') }}"
+          {% endfor %}
+
+    - name: Create systemd service for macvlan shims
+      copy:
+        dest: /etc/systemd/system/macvlan-shims.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Macvlan Shim Interfaces for Docker
+          After=network.target docker.service
+          Requires=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/root/create-macvlan-shim.sh
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable macvlan shims service
+      systemd:
+        name: macvlan-shims
+        enabled: yes
+        daemon_reload: yes
+
+#    - name: Create Docker network management script
+#      copy:
+#        dest: /root/manage-docker-networks.sh
+#        mode: '0755'
+#        content: |
+#          #!/bin/bash
+#          
+#          case "$1" in
+#            recreate)
+#              echo "Recreating Docker macvlan networks..."
+#              {% for network in docker_macvlan_networks %}
+#              echo "Removing {{ network.name }}..."
+#              docker network rm {{ network.name }} 2>/dev/null || true
+#              echo "Creating {{ network.name }}..."
+#              docker network create -d macvlan \
+#                --subnet={{ network.subnet }} \
+#                --gateway={{ network.gateway }} \
+#                --ip-range={{ network.ip_range }} \
+#                -o parent={{ network.vlan_interface }} \
+#                {{ network.name }}
+#              {% endfor %}
+#              echo "✓ Networks recreated successfully"
+#              ;;
+#            
+#            remove)
+#              echo "Removing Docker macvlan networks..."
+#              {% for network in docker_macvlan_networks %}
+#              docker network rm {{ network.name }} 2>/dev/null && echo "✓ Removed {{ network.name }}" || echo "✗ {{ network.name }} not found or in use"
+#              {% endfor %}
+#              ;;
+#            
+#            list)
+#              docker network ls
+#              ;;
+#            
+#            inspect)
+#              {% for network in docker_macvlan_networks %}
+#              echo "════════════════════════════════════════════════"
+#              echo "Network: {{ network.name }} ({{ network.description }})"
+#              echo "VLAN: {{ network.vlan_id }}"
+#              echo "Gateway: {{ network.gateway }} (Firewall)"
+#              echo "════════════════════════════════════════════════"
+#              docker network inspect {{ network.name }}
+#              echo ""
+#              {% endfor %}
+#              ;;
+#            
+#            test-firewall)
+#              echo "Testing firewall connectivity..."
+#              {% for network in docker_macvlan_networks %}
+#              echo ""
+#              echo "Testing VLAN {{ network.vlan_id }} gateway ({{ network.gateway }}):"
+#              ping -c 3 {{ network.gateway }} && echo "✓ Reachable" || echo "✗ Unreachable"
+#              {% endfor %}
+#              ;;
+#            
+#            *)
+#              echo "Docker macvlan Network Management Script"
+#              echo ""
+#              echo "Usage: $0 {recreate|remove|list|inspect|test-firewall}"
+#              echo ""
+#              echo "Commands:"
+#              echo "  recreate      - Remove and recreate all macvlan networks"
+#              echo "  remove        - Remove all macvlan networks"
+#              echo "  list          - List all Docker networks"
+#              echo "  inspect       - Show detailed information about each network"
+#              echo "  test-firewall - Test connectivity to firewall gateways"
+#              exit 1
+#              ;;
+#          esac
+
+    - name: Create architecture documentation
+      copy:
+        dest: /root/docker-architecture.txt
+        mode: '0644'
+        content: |
+          ----------------------------------------------------------------
+          |     Docker Segmented Architecture with macvlan Networks      |
+          ----------------------------------------------------------------
+          
+          Server: {{ inventory_hostname }}
+          Physical NIC: {{ mgmt_interface }}
+          
+          Network Architecture:
+          
+          {% for network in docker_macvlan_networks %}
+          VLAN {{ network.vlan_id }}: {{ network.description }}
+            Docker Network: {{ network.name }}
+            Driver: macvlan
+            Parent: {{ network.vlan_interface }}
+            Subnet: {{ network.subnet }}
+            Gateway: {{ network.gateway }} (Firewall)
+            Container IPs: {{ network.ip_range }}
+          
+          {% endfor %}
+          
+          Traffic Flow:
+          
+          Intra-Service (e.g., Keycloak ↔ PostgreSQL):
+            • Uses internal Docker bridge network
+            • Traffic stays on host
+            • Fast, low latency
+            • Never goes to firewall
+          
+          Inter-Service (e.g., Service A ↔ Service B):
+            • Uses macvlan network IPs
+            • Traffic exits host via parent VLAN interface
+            • Goes through physical switch
+            • Routes through FIREWALL for IPS inspection
+            • Firewall enforces security policies
+            • Returns to destination service
+          
+          External Access (e.g., Client → Service):
+            • Client connects to service VLAN IP
+            • Goes through firewall
+            • IPS/IDS inspection
+            • Routes to appropriate VLAN
+            • Delivered to container
+          
+          Security Features:
+            • IP forwarding disabled on host
+            • Host cannot route between VLANs
+            • Each service isolated in its own VLAN
+            • All inter-service traffic through firewall
+            • IPS/IDS inspection on all inter-VLAN traffic
+            • Centralized security policy enforcement
+            • Complete traffic visibility at firewall
+          
+          Firewall Configuration Required:
+          ═══════════════════════════════════════════════════════════════
+          {% for network in docker_macvlan_networks %}
+            • VLAN {{ network.vlan_id }}: {{ network.gateway }} as gateway
+          {% endfor %}
+            • Enable inter-VLAN routing
+            • Configure IPS/IDS on all inter-VLAN traffic
+            • Create security policies
+            • Enable logging
+          
+          Helper Scripts:
+          ═══════════════════════════════════════════════════════════════
+            • /root/verify-docker-networks.sh
+            • /root/create-macvlan-shim.sh
+            • /root/manage-docker-networks.sh
+          
+          Next Steps:
+          ═══════════════════════════════════════════════════════════════
+            1. Configure firewall gateways
+            2. Create macvlan shims: /root/create-macvlan-shim.sh
+            3. Test firewall: /root/manage-docker-networks.sh test-firewall
+            4. Deploy services with appropriate compose files
+
+    - name: Display completion summary
+      debug:
+        msg:
+          - "Helper Scripts:"
+          - "  • Verify: /root/verify-docker-networks.sh"
+          - "  • Manage: /root/manage-docker-networks.sh"
+          - "  • Shims:  /root/create-macvlan-shim.sh"
+          - "  • Docs:   /root/docker-architecture.txt"
+          - ""
+          - "Next Steps:"
+          - "  1. Configure firewall gateways for each VLAN"
+          - "  2. Create macvlan shims: sudo /root/create-macvlan-shim.sh"
+          - "  3. Test firewall: sudo /root/manage-docker-networks.sh test-firewall"
+          - "  4. Deploy Keycloak: docker-compose -f docker-compose-keycloak-corrected.yml up -d"
+          - ""
+
+# *** STOP ***

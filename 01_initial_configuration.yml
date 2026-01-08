@@ -1,0 +1,174 @@
+---
+- name: Ubuntu Server 24 Initial Configuration Playbook
+  hosts: servers
+  become: yes
+  tasks:
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+
+
+    - name: Install security tools
+      apt:
+        name:
+          - ufw
+          - fail2ban
+          - apt-listchanges
+          - clamav
+          - clamav-daemon
+          - auditd
+          - aide
+#         - THIS IS WHERE YOU CAN ADD OR REMOVE ANY OTHER APT PACKAGES FOR SECURITY   
+        state: present
+
+    - name: Configure SSH - Disable password authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        state: present
+      notify: restart sshd
+
+    - name: Configure SSH - Enable public key authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PubkeyAuthentication'
+        line: 'PubkeyAuthentication yes'
+        state: present
+      notify: restart sshd
+
+    - name: Configure SSH - Disable root login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+        state: present
+      notify: restart sshd
+
+    - name: Configure SSH - Disable empty passwords
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitEmptyPasswords'
+        line: 'PermitEmptyPasswords no'
+        state: present
+      notify: restart sshd
+
+    - name: Configure SSH - Set max authentication attempts
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?MaxAuthTries'
+        line: 'MaxAuthTries 3'
+        state: present
+      notify: restart sshd
+
+    - name: Configure SSH - Disable X11 forwarding
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?X11Forwarding'
+        line: 'X11Forwarding no'
+        state: present
+      notify: restart sshd
+
+    - name: Configure SSH - Set login grace time
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?LoginGraceTime'
+        line: 'LoginGraceTime 30'
+        state: present
+      notify: restart sshd
+
+    - name: Configure SSH - Use only strong ciphers
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Ciphers'
+        line: 'Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr'
+        state: present
+      notify: restart sshd
+
+    - name: Configure SSH - Use only strong MACs
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?MACs'
+        line: 'MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256'
+        state: present
+      notify: restart sshd
+
+    - name: Configure SSH - Use only strong key exchange algorithms
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?KexAlgorithms'
+        line: 'KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256'
+        state: present
+      notify: restart sshd
+
+    - name: Ensure fail2ban is started and enabled
+      service:
+        name: fail2ban
+        state: started
+        enabled: yes
+
+    - name: Configure fail2ban for SSH
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 3
+
+          [sshd]
+          enabled = true
+          port = ssh
+          logpath = /var/log/auth.log
+          maxretry = 3
+      notify: restart fail2ban
+
+    - name: Set permissions on sensitive files
+      file:
+        path: "{{ item }}"
+        mode: '0600'
+      loop:
+        - /etc/ssh/sshd_config
+        - /etc/gshadow
+        - /etc/shadow
+
+    - name: Set permissions on /etc/passwd
+      file:
+        path: /etc/passwd
+        mode: '0644'
+
+    - name: Ensure auditd is started and enabled
+      service:
+        name: auditd
+        state: started
+        enabled: yes
+
+    - name: Remove unnecessary packages
+      apt:
+        name:
+          - telnet
+          - rsh-client
+          - rsh-redone-client
+        state: absent
+        purge: yes
+
+  handlers:
+    - name: restart sshd
+      service:
+        name: ssh
+        state: restarted
+
+    - name: restart fail2ban
+      service:
+        name: fail2ban
+        state: restarted
+
+#  FOR MORE SECURITY BASELINES SEE DISA STIG PLAYBOOK AVAILABLE AT http[esse]://www[dot]cyber[dot]mil/stigs/supplemental-automation-content/

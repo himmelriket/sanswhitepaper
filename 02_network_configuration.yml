@@ -1,0 +1,195 @@
+---
+- name: Configure network with VLANs for Docker macvlan (Segmented Architecture)
+  hosts: servers
+  become: yes
+  vars:
+    mgmt_interface: enp89s0
+    mgmt_ip: 192.168.1.10/24
+    mgmt_gateway: 192.168.1.1
+    dns_servers: [192.168.1.1]
+    vlans:
+      - id: 101
+        description: "VLAN NAME HERE"
+      - id: 102
+        description: "VLAN NAME HERE"
+      - id: 103
+        description: "VLAN NAME HERE"
+      - id: 104
+        description: "VLAN NAME HERE"
+      - id: 105
+        description: "VLAN NAME HERE"
+
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - vlan
+          - net-tools
+          - ifupdown
+        state: present
+        update_cache: yes
+
+    - name: Load 8021q kernel module
+      modprobe:
+        name: 8021q
+        state: present
+
+    - name: Make 8021q module load at boot
+      lineinfile:
+        path: /etc/modules
+        line: '8021q'
+        create: yes
+        state: present
+
+    - name: Find existing netplan configurations
+      find:
+        paths: /etc/netplan/
+        patterns: "*.yaml,*.yml"
+      register: netplan_files
+
+    - name: Backup existing netplan configurations
+      copy:
+        src: "{{ item.path }}"
+        dest: "{{ item.path }}.backup-{{ ansible_date_time.epoch }}"
+        remote_src: yes
+      loop: "{{ netplan_files.files }}"
+      when: netplan_files.files | length > 0
+
+    - name: Remove old netplan configurations
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ netplan_files.files }}"
+      when: netplan_files.files | length > 0
+
+    - name: Create netplan configuration for VLAN
+      copy:
+        dest: /etc/netplan/01-network-config.yaml
+        mode: '0600'
+        content: |
+          # Segmented Docker Architecture Network Configuration
+          # VLANs for macvlan
+          # Each VLAN will be used by Docker macvlan driver
+          # All inter-VLAN traffic must go through external gateway
+          
+          network:
+            version: 2
+            renderer: networkd
+            ethernets:
+              {{ mgmt_interface }}:
+                addresses: [{{ mgmt_ip }}]
+                routes:
+                  - to: default
+                    via: {{ mgmt_gateway }}
+                nameservers:
+                  addresses: {{ dns_servers }}
+            vlans:
+          {% for vlan in vlans %}
+              {{ mgmt_interface }}.{{ vlan.id }}:
+                id: {{ vlan.id }}
+                link: {{ mgmt_interface }}
+                addresses: []
+                dhcp4: no
+                dhcp6: no
+          {% endfor %}
+
+    - name: Test netplan configuration syntax
+      command: netplan generate
+      register: netplan_test
+      failed_when: netplan_test.rc != 0
+
+    - name: Display netplan test results
+      debug:
+        msg: "Netplan configuration syntax is valid"
+
+    - name: Apply netplan configuration
+      command: netplan apply
+      async: 45
+      poll: 0
+      register: netplan_job
+
+    - name: Wait for network reconfiguration to complete
+      pause:
+        seconds: 15
+        prompt: "*** Waiting for network to reconfigure ***"
+
+    - name: Verify network connectivity
+      wait_for_connection:
+        timeout: 10
+        delay: 5
+
+    - name: Verify management interface is configured
+      shell: ip addr show {{ mgmt_interface }} | grep "{{ mgmt_ip.split('/')[0] }}"
+      register: mgmt_check
+      changed_when: false
+      failed_when: mgmt_check.rc != 0
+
+    - name: Verify VLAN interfaces exist
+      shell: ip link show {{ mgmt_interface }}.{{ item.id }}
+      register: vlan_check
+      changed_when: false
+      failed_when: vlan_check.rc != 0
+      loop: "{{ vlans }}"
+
+    - name: Disable IP forwarding
+      sysctl:
+        name: "{{ item }}"
+        value: '0'
+        state: present
+        reload: yes
+      loop:
+        - net.ipv4.ip_forward
+        - net.ipv4.conf.all.forwarding
+        - net.ipv6.conf.all.forwarding
+
+    - name: Verify IP forwarding is disabled
+      shell: |
+        echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward)"
+        echo "IPv4 all forwarding: $(sysctl -n net.ipv4.conf.all.forwarding)"
+        echo "IPv6 forwarding: $(sysctl -n net.ipv6.conf.all.forwarding)"
+      register: forwarding_status
+      changed_when: false
+
+    - name: Display IP forwarding status
+      debug:
+        msg: "{{ forwarding_status.stdout_lines }}"
+
+    - name: Get network configuration summary
+      shell: |
+        echo "*** Management Interface ***"
+        ip addr show {{ mgmt_interface }}
+        echo ""
+        echo "*** VLAN Interfaces ***"
+        {% for vlan in vlans %}
+        echo "VLAN {{ vlan.id }} - {{ vlan.description }}"
+        ip addr show {{ mgmt_interface }}.{{ vlan.id }}
+        echo ""
+        {% endfor %}
+        echo "*** VLAN Configuration ***"
+        cat /proc/net/vlan/config
+        echo ""
+        echo "*** IP Forwarding Configuration Summary ***"
+        sysctl net.ipv4.ip_forward
+        sysctl net.ipv4.conf.all.forwarding
+        sysctl net.ipv6.conf.all.forwarding
+      register: network_info
+      changed_when: false
+
+    - name: Display network configuration
+      debug:
+        var: network_info.stdout_lines
+
+    - name: Configure SSH to listen only on management IP
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?ListenAddress'
+        line: 'ListenAddress {{ mgmt_ip.split("/")[0] }}'
+        state: present
+        backup: yes
+      notify: restart sshd
+
+  handlers:
+    - name: restart sshd
+      service:
+        name: ssh
+        state: restarted

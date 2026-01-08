@@ -1,0 +1,164 @@
+---
+- name: Install Docker Engine on Ubuntu Using Official Docker Documentation Method
+  hosts: servers
+  become: yes
+
+  tasks:
+    - name: Get list of installed conflicting Docker packages
+      shell: dpkg --get-selections docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc 2>/dev/null | cut -f1
+      register: conflicting_packages
+      changed_when: false
+      failed_when: false
+
+    - name: Remove old Docker versions and conflicting packages
+      shell: apt remove -y {{ conflicting_packages.stdout_lines | join(' ') }}
+      when: conflicting_packages.stdout_lines | length > 0
+      register: remove_result
+      failed_when: false
+
+    - name: Display removed packages
+      debug:
+        msg: "Removed packages: {{ conflicting_packages.stdout_lines }}"
+      when: conflicting_packages.stdout_lines | length > 0
+
+    - name: Remove old Docker repository configurations
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/docker.list
+        - /etc/apt/sources.list.d/docker.sources
+        - /etc/apt/keyrings/docker.gpg
+      ignore_errors: yes
+
+    - name: Update apt package index
+      apt:
+        update_cache: yes
+
+    - name: Install ca-certificates and curl
+      apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+
+    - name: Create /etc/apt/keyrings directory with proper permissions
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Docker's official GPG key
+      shell: curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      args:
+        creates: /etc/apt/keyrings/docker.asc
+
+    - name: Set permissions on Docker GPG key
+      file:
+        path: /etc/apt/keyrings/docker.asc
+        mode: 'a+r'
+
+    - name: Get Ubuntu codename
+      shell: . /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+      register: ubuntu_codename
+      changed_when: false
+
+    - name: Add Docker repository to apt sources
+      copy:
+        dest: /etc/apt/sources.list.d/docker.sources
+        content: |
+          Types: deb
+          URIs: https://download.docker.com/linux/ubuntu
+          Suites: {{ ubuntu_codename.stdout }}
+          Components: stable
+          Signed-By: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+    - name: Update apt package index after adding Docker repository
+      apt:
+        update_cache: yes
+
+    - name: Install Docker Engine, CLI, containerd, and plugins
+      shell: |
+        apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      register: docker_install
+      changed_when: "'0 newly installed' not in docker_install.stdout"
+
+    - name: Start Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Check Docker service status
+      systemd:
+        name: docker
+        state: started
+      register: docker_status
+
+    - name: Verify Docker installation
+      command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Verify Docker Compose installation
+      command: docker compose version
+      register: docker_compose_version
+      changed_when: false
+
+    - name: Display Docker version
+      debug:
+        msg:
+          - "Docker installed successfully!"
+          - "{{ docker_version.stdout }}"
+          - "{{ docker_compose_version.stdout }}"
+
+    - name: Add user to docker group
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+      when: ansible_user is defined
+
+    - name: Create Docker daemon configuration directory
+      file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+
+    - name: Configure Docker daemon for segmented architecture
+      copy:
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+        content: |
+          {
+            "iptables": false,
+            "ip-forward": false,
+            "userland-proxy": false,
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }
+      register: daemon_config
+
+    - name: Restart Docker to apply daemon configuration
+      systemd:
+        name: docker
+        state: restarted
+      when: daemon_config.changed
+
+    - name: Wait for Docker to be ready after restart
+      wait_for:
+        path: /var/run/docker.sock
+        state: present
+        timeout: 30
+
+    - name: Set vm.max_map_count for Elasticsearch/OpenSearch compatibility
+      sysctl:
+        name: vm.max_map_count
+        value: '262144'
+        state: present
+        reload: yes
+        sysctl_set: yes
