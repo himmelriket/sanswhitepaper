@@ -1,0 +1,24 @@
+
+# Main servers where services are run on
+[servers]
+sv01
+
+# Backup severs
+[backup_servers]
+
+
+# Workstations
+[workstations]
+
+
+[all:vars]
+ansible_user=automation_admin
+ansible_ssh_private_key_file=~/.ssh/id_rsa_kali
+
+# ansible_python_interpreter=/usr/bin/python3
+# ansible_become=yes
+# ansible_become_method=sudo
+# ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+
+# ansible_connection=ssh
+# ansible_port=22
